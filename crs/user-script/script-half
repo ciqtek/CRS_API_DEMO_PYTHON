@@ -1,0 +1,702 @@
+import os
+import sys
+from struct import pack, unpack
+from copy import deepcopy
+import numpy as np
+#import matplotlib.pyplot as plt
+
+MODE_T = 0x00 # tirgger mode
+MODE_C = 0x01 # continue mode
+T = MODE_T  
+C = MODE_C  
+_MODE_CLASS = [MODE_T, MODE_C]
+
+_WAVE_ALLOWED_TYPE = ['sin', 'gauss', 'square', 'triangle']
+
+_ENCODE_MAX  = 65535
+_ENCODE_ZERO = 32768
+
+_OUT_DATA_ = False
+_OUT_SEG_ = False
+
+none = None
+
+global WD
+WD  = ''
+
+def Encode(arr):
+    """
+    还是浮点数
+    """
+    ret = np.where(arr < -500.0, 0,
+            np.where(arr<0.0, (arr/500.0 + 1) * _ENCODE_ZERO,
+                np.where(arr<500.0, (arr/500.0) * (_ENCODE_MAX-_ENCODE_ZERO) + _ENCODE_ZERO, _ENCODE_MAX)))
+    return np.array(ret) #, dtype=np.int)
+
+def Decode(arr):
+    ret = np.where(arr < _ENCODE_ZERO,
+            (arr / _ENCODE_ZERO - 1) * 500.0,
+            (arr - _ENCODE_ZERO) / (_ENCODE_MAX - _ENCODE_ZERO) * 500.0)
+    return ret
+
+def normalize(data):
+    absmax = np.max(np.abs(data))
+    ret = data /  absmax
+    return ret, absmax
+
+
+def gen_sin_data(params, t0):
+    """
+    params: [freq, amp, L, ph0, bias]
+    """
+    freq = params[0]
+    amp = params[1]
+    L = params[2]
+    ph0 = params[3]
+    bias = params[4]
+
+    t = 0.001 * (np.linspace(0, L-1, L) + t0)
+    w = Encode(amp * np.sin(2 * np.pi * (freq * t + ph0)) + bias)
+
+    return w, t0 + L
+
+
+class WAVE:
+    wid = 0
+    def __init__(self, wave, mode='volt'):
+        self.id = WAVE.wid
+        WAVE.wid += 1
+        self.type = ''
+        self.params = []  # params: [f, A, T, ph0, bias]
+        self.data = None
+        self.corr_wave = None
+
+        if type(wave) is list or type(wave) is np.ndarray:
+            self.type = 'data'
+            if mode == 'volt':
+                self.data = Encode(np.array(wave))
+            elif mode == 'code':
+                self.data = np.array(wave, dtype=np.int)
+        elif type(wave) is str:
+            if len(wave) > 5 and wave[-5:] == '.wave':
+                fullfilename = ''
+                if os.path.isfile(wave):
+                    fullfilename = wave
+                elif os.path.isfile(os.path.join(WD, wave)):
+                    fullfilename = os.path.join(WD, wave)
+            
+                if fullfilename != '':
+                    # 从文件中读取数据
+                    print(fullfilename)
+                    self.type = 'data'
+                    with open(fullfilename, 'rb') as f:
+                        raw = f.read()
+                        size = int(len(raw) / 2)
+                        self.data = np.array(list(unpack('%sH'%size, raw)))
+                        f.close()
+                        #print(type(self.data), len(self.data))
+            else:
+                # 用于后面自定义函数
+                self.type = wave
+
+    def length(self):
+        if self.type is 'data':
+            return len(self.data)
+        elif self.type is 'sin':
+            return self.params[2]
+        elif self.type in ['mul', 'add']:
+            return self.corr_wave[0].length()
+        else:
+            return 0
+
+    def __call__(self, loop, mode):
+        return SubSegment(self, loop, mode)
+
+    @staticmethod
+    def __data_mul(d1, d2):
+        """
+        返回纯数据
+        """
+        v1, m1 = normalize(Decode(d1))
+        v2, m2 = normalize(Decode(d2))
+        amp = np.sqrt(m1 * m2)
+        new_data = amp * v1 * v2
+        return new_data
+
+    def __mul__(self, obj):
+        if type(obj) is WAVE and self.length() == obj.length():
+            if self.type == 'data' and obj.type == 'data':
+                return WAVE(WAVE.__data_mul(self.data, obj.data))
+            else:
+                ret = WAVE('mul')
+                ret.corr_wave = [self, obj]
+                return ret
+        elif type(obj) is float or type(obj) is int:
+            ret = WAVE('mul')
+            ret.corr_wave = [self, float(obj)]
+            return ret
+
+    def __rmul__(self, gain):
+        if type(gain) is float or type(gain) is int:
+            return self.__mul__(gain)
+
+    @staticmethod
+    def __data_add(d1, d2):
+        """
+        返回纯数据
+        """
+        v1 = Decode(d1)
+        v2 = Decode(d2)
+        return v1 + v2
+
+    def __add__(self, obj):
+        if type(obj) is WAVE and self.length() == obj.length():
+            if self.type == 'data' and obj.type == 'data':
+                return WAVE(WAVE.__data_mul(self.data, obj.data))
+            else:
+                ret = WAVE('add')
+                ret.corr_wave = [self, obj]
+                return ret
+    
+    def is_expand(self):
+        """
+        波形是否需要展开, 如果是/包含 'sin' 则是
+        """
+        if self.type == 'sin':
+            return True
+        elif self.type == 'mul' or self.type == 'add':
+            return (self.corr_wave[0].is_expand() or self.corr_wave[1].is_expand())
+        else:
+            return False
+
+    def gen_data(self, t0):
+        """
+        t0, current time in a segment, if WAVE is 'sin' type, update
+        return (data, tf, is_new)
+                data: wave data,
+                tf: final time,
+                is_new: if it is a new WAVE
+        """
+        if self.type == 'data':
+            return self.data, t0+self.length(), False
+
+        elif self.type == 'sin':
+            # 将会生成新WAVE
+            d, tf = gen_sin_data(self.params, t0)
+            return d, tf, True
+
+        elif self.type == 'mul':
+            # 可能产生新 WAVE
+            # 相位会产生分歧
+            if type(self.corr_wave[1]) is WAVE:
+                d1, tf1, isnew1 = self.corr_wave[0].gen_data(t0)
+                d2, tf2, isnew2 = self.corr_wave[1].gen_data(t0)
+                if isnew1 or isnew2:
+                    nwd = Encode(WAVE.__data_mul(d1, d2))
+                    tf = t0 + self.length()
+                    print("[log]: WAVE.gen_data.mul, new wave length", len(nwd), ", final phase", tf)
+                    return nwd, tf, True
+                else:
+                    self.data = WAVE.__data_mul(d1, d2)
+                    self.type = 'data'
+                    return self.data, t0 + self.length(), False
+            elif type(self.corr_wave[1]) is float:
+                gain = self.corr_wave[1]
+                d, tf, isnew = self.corr_wave[0].gen_data(t0)
+                if isnew:
+                    nwd = Encode(gain * Decode(d))
+                    tf = t0 + self.length()
+                    print("[log]: WAVE.gen_data.mul, new wave length", len(nwd), ", final phase", tf)
+                    return nwd, tf, True
+                else:
+                    self.data = Encode(gain * Decode(d))
+                    self.type = 'data'
+                    return self.data, t0 + self.length(), False
+
+        elif self.type == 'add':
+             # 可能产生新 WAVE
+            # 相位会产生分歧
+            d1, tf1, isnew1 = self.corr_wave[0].gen_data(t0)
+            d2, tf2, isnew2 = self.corr_wave[1].gen_data(t0)
+            if isnew1 or isnew2:
+                nwd = Encode(WAVE.__data_add(d1, d2))
+                tf = t0 + self.length()
+                print("[log]: WAVE.gen_data.add, new wave length", len(nwd), ", final phase", tf)
+                return nwd, tf, True
+            else:
+                self.data = WAVE.__data_add(w1.data, w2.data)
+                self.type = 'data'
+                return self.data, t0 + self.length(), False
+
+        else:
+            return None, t0, False
+    
+    def _describe_b(self):
+        """
+        return (id, binary data)
+        """
+        return (self.id, self.data)
+
+
+class SubSegment:
+    def __init__(self, obj, loop=1, mode=C):
+        if type(obj) is WAVE and type(loop) is int and loop > 0 and mode in _MODE_CLASS:
+            self.w = obj
+            self.l = loop
+            self.m = mode
+        else:
+            raise Exception('Error: paramer error, when construct a SEQ')
+    
+    def gen_data(self, t0):
+        """
+        两种情况，1: 不保持连续 l -> l; 保持连续: l -> 1
+        t0: final time
+        """
+        if self.w.is_expand():
+            wd = np.array([])
+            tf = t0
+            for i in range(self.l):
+                data, tf, isnew = self.w.gen_data(tf)
+                wd = np.append(wd, data)
+            self.w = WAVE(np.array(wd, dtype=int), 'code')
+            self.l = 1
+            print("[log] SubSegment: gen new wave, id=", self.w.id, ", length=", self.w.length(), "final time:", tf)
+            return tf
+        else:
+            d, tf, isnew = self.w.gen_data(0)
+            self.w.data = np.array(d, dtype=int)
+            return t0 + self.w.length() * self.l
+
+
+class SEQ:
+    sid = 0
+    def __init__(self, obj=None, loop=1, mode=T):
+        self.id = SEQ.sid
+        SEQ.sid += 1
+        self.seg_list = []
+        self.seg_length_list = []
+        if obj is None:
+            pass
+        elif type(obj) is list:
+            self.__appseg(obj)
+        else:
+            raise Exception('Error: wrong type when construct a SEQ Object')
+
+    def __appseg(self, obj):
+        if type(obj) is list:
+            seg = None
+            for sseg in obj:
+                if type(sseg) is SubSegment:
+                    if sseg.m == T:
+                        if seg is not None:
+                            seg.extend([0, 28])
+                            self.seg_list.append(seg)
+                        seg = []
+                        seg.append(sseg)
+                    else:
+                        seg.append(sseg)
+                else:
+                    raise Exception('Error: wrong type {} it should a WAVE'.format(type(sseg)))
+            seg.extend([0, 28])
+            self.seg_list.append(seg)
+                    
+            # [0]) is SubSegment and len(obj) >= 2:
+            # seg = []
+            # ptyp = type(obj[0])
+            # t = []
+            # num = 0
+            # for it in obj:
+            #     if type(it) in [SubSegment, int]:
+            #         if type(it) == ptyp:
+            #             num += 1
+            #         else:
+            #             ptyp = type(it)
+            #             t.append(num)
+            #             num = 1
+            #     else:
+                    
+            # t.append(num)
+            # #print('SEQ-{}: {}'.format(self.id, t))
+            
+            # pos = 0
+            # for i in range(0, len(t), 2):
+            #     if t[i+1] == 1:
+            #         end = pos + t[i] + 1
+            #         self.segs.append(obj[pos:end]+[28])
+            #         pos = end                    
+            #     else:
+            #         raise Exception('Error: wrong paramers number')
+
+            # # print(len(self.segs))
+            # # for seq in self.segs:
+            # #    print(seq)
+        else:
+            raise Exception('Error: paramers is not enough')
+
+    def __add__(self, obj):
+        if type(obj) is list:
+            ret = SEQ()
+            ret.seg_list = deepcopy(self.seg_list)
+            ret.__appseg(obj)
+            return ret
+        elif type(obj) is SEQ:
+            ret = SEQ()
+            ret.seg_list = self.seg_list + obj.seg_list
+            return ret
+        else:
+            raise Exception('Object is not SEQ or list')
+        
+    def __iadd__(self, obj):
+        if type(obj) is list:
+            self.__appseg(obj)
+            return self
+        elif type(obj) is SEQ:
+            self.seg_list += obj.seg_list
+            return self
+        else:
+            raise Exception('Object is not SEQ or list')
+
+    def __call__(self, loop): #, waitime=0):
+        return ADVS(self, loop) #, waitime)
+    
+    def update(self):
+        self.seg_length_list = []
+        for seg in self.seg_list:
+            t0 = 0
+            for ss in seg[0:-2]:
+                t0 = ss.gen_data(t0)
+            seg[-2] = t0
+            self.seg_length_list.append(t0 + seg[-1])
+
+    def _describe(self):
+        self.update()
+        desc = '{SEQ-' + str(self.id) + ','
+        for seg in self.seg_list:
+            desc += " [(WAVE-{}, {}, {}".format(seg[0].w.id, seg[0].l, seg[0].m)
+            for subs in seg[1:-2]:
+                desc += "; WAVE-{}, {}, {}".format(subs.w.id, subs.l, subs.m)
+            desc += '), ' + str(seg[-2]) + ', ' + str(seg[-1]) + ']'
+        desc += '}'
+        return desc
+
+    def expand(self):
+        self.update()
+        data = []
+        enable_signal = []
+        trigger_wave_len = []
+        for seg in self.seg_list:
+            for subseg in seg[:-2]:
+                if subseg.m is T:
+                    enable_signal.append(len(data))
+                    trigger_wave_len.append(len(subseg.w.data) * subseg.l)
+                data += list(subseg.w.data) * subseg.l
+            data += [_ENCODE_ZERO] * seg[-1]
+        return data, enable_signal, trigger_wave_len
+
+
+class ADVS:
+    aid = 0
+    def __init__(self, obj=None, loop=1): #, waitime=0):
+        self.id = ADVS.aid
+        ADVS.aid += 1
+        #waitime = int(waitime)
+        self.seg_length_list = []
+        if obj is None:
+            self.seq_list = []
+        elif type(obj) is SEQ and type(loop) is int and loop > 0:
+            self.seq_list = [(obj, loop, 0)] #waitime)]
+        elif type(obj) is ADVS:
+            self.seq_list = deepcopy(obj.seq_list)
+        else:
+            raise Exception('Error: wrong type, when construct a ADVS object.')
+        
+    def __add__(self, nadvs):
+        if type(nadvs) is ADVS:
+            ret = ADVS()
+            ret.seq_list = self.seq_list + nadvs.seq_list
+            return ret
+        else:
+            raise Exception('Error: wrong type, when a ADVS add to')
+    
+    def __iadd__(self, nadvs):
+        if type(nadvs) is ADVS:
+            self.seq_list += nadvs.seq_list
+            return self
+        else:
+            raise Exception('Error: wrong type, when a ADVS add to')
+    
+    def update(self):
+        self.seg_length_list = []
+        for sp in self.seq_list:
+            s, l, wt = sp
+            s.update()
+            self.seg_length_list.extend(s.seg_length_list)
+
+    def _describe(self):
+        self.update()
+        desc =  '{ADVS-'+str(self.id)
+        for sp in self.seq_list:
+            s, l, wt = sp
+            if type(s) is SEQ:
+                #desc += ', (' + "SEQ-{}, {}, {}".format(s.id, l, wt) + ')'
+                desc += ', (' + "SEQ-{}, {}".format(s.id, l) + ')'
+        desc += '}'
+        return desc
+
+    def expand(self):
+        self.update()
+        data = []
+        enable_signal = []
+        trigger_wave_len = []
+        for sp in self.seq_list:
+            seq, sl, swt = sp
+            if type(seq) is SEQ:
+                es_offset = len(data)
+                d, es, twl = seq.expand()
+                data += d * sl
+                trigger_wave_len += twl * sl
+                for i in range(sl):
+                    for it in es:
+                        enable_signal.append(es_offset + len(d) * i + it)
+            data += [_ENCODE_ZERO] * swt
+        return data, enable_signal, trigger_wave_len
+
+GAmp = 300
+
+
+def Sin(f, A=None, L=None, ph0=0, b=0):
+    '''
+    f : 频率, MHz
+    T : 持续时长，整数 ns
+    '''
+    if A == None:
+        A = GAmp
+    
+    if L == None or L<=0:
+        L = 1000 / f
+    L = int(L)
+
+    t = 0.001 * np.linspace(0, L-1, L)
+    w = A * np.sin(2 * np.pi * (f * t + ph0)) + b
+    ret = WAVE(w)    
+    return ret
+
+
+def SinC(f, A=None, L=None, ph0=0, b=0):
+    if A == None:
+        A = GAmp
+
+    if L == None or L<=0:
+        L = 1000 / f
+    L = int(L)
+
+    p = [f, A, L, ph0, b]
+    ret = WAVE('sin')
+    ret.params = p
+
+    return ret
+
+
+def Gauss(var, A=None, L=None, b=0):
+    if A == None:
+        A = GAmp
+
+    if L == None:
+        L = 5 * var # sqrt(ln(32767 * A / 500))
+    L = int(L)
+    
+    t = np.linspace(-int(L/2), L-1-int(L/2), L)
+    w = A * np.exp(- t**2 / var**2) + b
+
+    ret = WAVE(w)
+    
+    return ret
+
+UP = 0x10
+DOWN = 0x11
+
+def Square(T, mode=UP, A=None, N=1):
+    w = []
+    if A == None:
+        A = GAmp
+    
+    if mode == UP:
+        flag = 1
+    elif mode == DOWN:
+        flag = -1
+    
+    beg = -flag * A
+    end = flag * A
+    w = [beg] * int(T/2) + [end] * (T-int(T/2))
+    w = w * N
+    ret = WAVE(w)
+    
+    return ret
+
+def Triangle(T, mode=UP, A=None, N=1):
+    w = []
+    if A == None:
+        A = GAmp
+
+    if mode == UP:
+        beg, end = -A, A
+    elif mode == DOWN:
+        beg, end = A, -A
+    
+    w = np.linspace(beg, end, T)
+    ret = WAVE(w)
+
+    return ret
+    
+    
+def detect(out):
+    wave_d = {}
+    seq_d  = {}
+    advs_d = {}
+    if type(out) is SEQ:
+        out.update()
+        for seg in out.seg_list:
+            for ss in seg[:-2]:
+                wave_d[ss.w.id] = ss.w
+        seq_d[out.id] = out
+    elif type(out) is ADVS:
+        out.update()
+        for sp in out.seq_list:
+            for seg in sp[0].seg_list:
+                for subs in seg[:-2]:
+                    wave_d[subs.w.id] = subs.w
+            seq_d[sp[0].id] = sp[0]
+        advs_d[out.id] = out
+    return wave_d, seq_d, advs_d, out.seg_length_list
+
+global OUT1
+global OUT2
+
+def _save_in_file(filename=None):
+    global OUT1, OUT2
+    
+    if type(OUT1) not in [SEQ, ADVS] or type(OUT2) not in [SEQ, ADVS]:
+        return
+    
+    if filename == None:
+        file = 'odmr-wave-data'
+    else:
+        file = filename
+
+    o = []
+    o.append('OUT1: {}-{}\n'.format(type(OUT1).__name__, OUT1.id))
+    o.append('OUT2: {}-{}'.format(type(OUT2).__name__, OUT2.id))
+    
+    wd,  sd,  ad,  sll  = detect(OUT1)
+    wd2, sd2, ad2, sll2 = detect(OUT2)
+    
+    for key in wd2:
+        wd[key] = wd2[key]
+    for key in sd2:
+        sd[key] = sd2[key]
+    for key in ad2:
+        ad[key] = ad2[key]
+    
+    for wkey in wd:
+        print("WAVE key:", wkey, "WAVE id:", wd[wkey].id, "WAVE length:", wd[wkey].length())
+
+    wdb = [] # 用于 WAVE 的二进制数据
+    for key in wd:
+        wdb.append(wd[key]._describe_b())
+    
+    txt_lines = []
+    # for key in wd:
+    #     print(wd[key]._describe())
+    #     txt_lines.append(wd[key]._describe()+'\n')
+    if sll == sll2:
+        txt_lines.append("!normal\n")
+    else:
+        txt_lines.append("!abort\n")
+    for key in sd:
+        txt_lines.append(sd[key]._describe()+'\n')
+    for key in ad:
+        txt_lines.append(ad[key]._describe()+'\n')
+    for l in o:
+        txt_lines.append(l)
+    
+    print('')
+    for l in txt_lines:
+        print(l, end='')
+
+    tdir = os.environ['TEMP']
+    # 
+    with open(os.path.join(tdir, file+'-b'), 'wb') as f:
+        f.write(pack('I', len(wdb)))
+        for wid, wdata in wdb:
+            f.write(pack('I', wid))
+            f.write(pack('I', len(wdata)))
+            f.write(pack('%sH'%len(wdata), *wdata))
+    # 
+    with open(os.path.join(tdir, file), 'w') as f:
+        f.writelines(txt_lines)
+        f.writelines(o)
+        f.close()
+
+def _save_in_file_b(filename):
+    global OUT1, OUT2
+    o1, es1, twl1 = OUT1.expand()
+    o2, es2, twl2 = OUT2.expand()
+    
+    path = os.environ['TEMP']
+    if filename is None:
+        filename = "odmr-binary-000000100010"
+    
+    if _OUT_DATA_:
+        l1 = len(o1)
+        l2 = len(o2)
+        print(l1, l2)
+        if l1<=l2:
+            for i in range(l1):
+                print('{:5d} ns:  {:6d}, {:6d}'.format(i, o1[i], o2[i]))
+            for i in range(l1, l2):
+                print('{:5d} ns:       , {:6d}'.format(i, o2[i]))
+        else:
+            for i in range(l2):
+                print('{:5d} ns: {:6d}, {:6d}'.format(i, o1[i], o2[i]))
+            for i in range(l2, l1):
+                print('{:5d} ns: {:6d}'.format(i, o1[i]))
+    if _OUT_SEG_:
+        print("out1 enable start:   ", es1)
+        print("out1 trigger length: ", twl1)
+        print("out2 enable start:   ", es2)
+        print("out2 trigger length: ", twl2)
+    
+    with open(os.path.join(path, filename), 'wb') as f:
+        f.write(pack('I', len(o1)))
+        f.write(pack('%sH'%len(o1), *o1))
+        f.write(pack('I', len(o2)))
+        f.write(pack('%sH'%len(o2), *o2))
+        f.write(pack('I', len(es1)))
+        f.write(pack('%sI'%len(es1), *es1))
+        f.write(pack('%sI'%len(twl1), *twl1))
+        f.write(pack('I', len(es2)))
+        f.write(pack('%sI'%len(es2), *es2))
+        f.write(pack('%sI'%len(twl2), *twl2))
+        f.close()
+    
+    #fig = plt.figure()
+    #plt.plot(o1)
+    #fig = plt.figure()
+    #plt.plot(o2)
+    #plt.show()
+
+#=======================================
+if __name__ == "__main__":
+    global OUT1, OUT2
+    PI = np.pi
+    filename = None
+    
+    ## 下面是用户自己写的内容
+    
+    @user
+
+    ## 用户书写部分到此结束
+    if sys.argv[1] == '-formal':
+        _save_in_file(filename)
+    elif sys.argv[1] == '-preview':
+        _save_in_file_b(filename)
